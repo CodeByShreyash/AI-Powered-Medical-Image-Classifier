@@ -147,7 +147,7 @@ if uploaded:
 # 4.  FOOTER & INFO ────────────────────────────────────────────────
 st.markdown("---")
 st.caption("© 2025 SkinSight AI | Built with Streamlit + PyTorch  •  "
-           "Contact: shreyasvishwakarma00@gmail.com")
+          )
 
 
 # import streamlit as st
