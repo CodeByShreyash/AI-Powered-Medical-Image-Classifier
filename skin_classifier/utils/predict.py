@@ -12,7 +12,9 @@ def load_model():
     from torchvision.models import efficientnet_b0
     model = efficientnet_b0(pretrained=False)
     model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, len(CLASSES))
-    model.load_state_dict(torch.load('model/skin_classifier.pt', map_location='cpu'))
+    # model.load_state_dict(torch.load('model/skin_classifier.pt', map_location='cpu'))
+    model.load_state_dict(torch.load('model/model.pth', map_location='cpu'))
+
     model.eval()
     return model
 
