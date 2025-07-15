@@ -1,82 +1,157 @@
 import streamlit as st
 import torch
+import torch.nn as nn
 from torchvision import transforms
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from torchvision.models import efficientnet_b0, resnet18
 from PIL import Image
 import numpy as np
-import os
-import matplotlib.pyplot as plt
-
 from utils.gradcam import GradCAM, overlay_heatmap
 
-# 🔹 Define your class names (same order as training)
-class_names = ['nv', 'mel', 'bkl', 'bcc', 'akiec', 'vasc', 'df']
+# --- CLASS LABELS ---
+efficientnet_classes = ['nv', 'mel', 'bkl', 'bcc', 'akiec', 'vasc', 'df']
+resnet18_classes = ['benign', 'malignant', 'suspicious', 'other']
 
-# 🔹 Load the model
+# --- MODEL LOADING FUNCTIONS ---
 @st.cache_resource
-def load_model():
-    weights = EfficientNet_B0_Weights.DEFAULT
+def load_efficientnet():
     model = efficientnet_b0(weights=None)
-    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, len(class_names))
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(efficientnet_classes))
     model.load_state_dict(torch.load("model/model.pth", map_location="cpu"))
     model.eval()
     return model
 
-model = load_model()
-target_layer = model.features[-1]
+@st.cache_resource
+def load_resnet18():
+    model = resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, len(resnet18_classes))
+    model.load_state_dict(torch.load("model/resnet18_skin_cancer.pth", map_location="cpu"))
+    model.eval()
+    return model
 
-# 🔹 Image transforms
+# --- IMAGE TRANSFORM ---
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
 
-# 🔹 Streamlit UI
-st.set_page_config(page_title="Skin Lesion Classifier", layout="centered")
-st.title("🧠 Skin Lesion Classifier with Grad-CAM")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="SkinSight AI", layout="wide")
 
-uploaded_file = st.file_uploader("Upload a skin lesion image", type=["jpg", "png", "jpeg"])
+# --- HERO SECTION ---
+with st.container():
+    st.markdown("<h1 style='text-align: center;'>Instant Skin Lesion<br><span style='color:#00d4aa'>Diagnosis with AI</span></h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Upload a photo. Get prediction & visual explanation in seconds.</p>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    # with col2:
+    #     st.button("Get Started")
+    #     st.button("Learn More")
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_container_width=True)
+st.markdown("---")
 
-    input_tensor = transform(image).unsqueeze(0)
+# --- MAIN SECTION ---
+st.subheader("AI-Powered Skin Analysis")
+st.caption("Upload a dermoscopic image to get instant analysis with visual explanations")
 
-    # 🔍 Grad-CAM
-    gradcam = GradCAM(model, target_layer)
-    heatmap = gradcam.generate(input_tensor)
+col_left, col_right = st.columns(2)
 
-    # 🔮 Prediction
-    with torch.no_grad():
-        outputs = model(input_tensor)
-        probs = torch.softmax(outputs, dim=1).squeeze().numpy()
-        pred_idx = np.argmax(probs)
-        pred_class = class_names[pred_idx]
+# --- LEFT: Upload & Predict ---
+with col_left:
+    uploaded_file = st.file_uploader("Upload Skin Image", type=["jpg", "jpeg", "png"])
 
-    # 🖼️ Grad-CAM overlay
-    image_np = np.array(image.resize((224, 224)))
-    cam_overlay = overlay_heatmap(heatmap, image_np)
+    if uploaded_file:
+        image = Image.open(uploaded_file).convert("RGB")
+        st.image(image, caption="Uploaded Image", use_container_width=True)
 
-    # 🔠 Display prediction
-    st.markdown(f"### 🏷️ Prediction: `{pred_class}`")
-    st.markdown("### 🔥 Grad-CAM Heatmap:")
-    st.image(cam_overlay, use_container_width=True)
+        model_option = st.selectbox("Select Model", ["EfficientNet B0 (7 classes)", "ResNet18 (4 classes)"], index=0)
 
-    # 📊 Class Probability Bar Chart
-    st.markdown("### 📊 Class Confidence Scores:")
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(class_names, probs, color='cornflowerblue')
-    ax.set_ylabel("Confidence")
-    ax.set_title("Model Prediction Confidence by Class")
+        # Apply transformation
+        input_tensor = transform(image).unsqueeze(0)
 
-    # Highlight predicted class
-    bars[pred_idx].set_color('crimson')
-    ax.text(pred_idx, probs[pred_idx] + 0.02, f"{probs[pred_idx]:.2f}",
-            ha='center', va='bottom', fontweight='bold')
+        # Model selection
+        if "EfficientNet" in model_option:
+            model = load_efficientnet()
+            class_names = efficientnet_classes
+            target_layer = model.features[-1]
+        else:
+            model = load_resnet18()
+            class_names = resnet18_classes
+            target_layer = model.layer4[-1]
 
-    st.pyplot(fig)
+        # Grad-CAM setup
+        gradcam = GradCAM(model, target_layer)
+        heatmap = gradcam.generate(input_tensor)
+
+        # Prediction
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            probs = torch.softmax(outputs, dim=1).squeeze().numpy()
+            pred_idx = np.argmax(probs)
+            pred_class = class_names[pred_idx]
+            confidence = probs[pred_idx]
+
+# --- RIGHT: Results ---
+with col_right:
+    if uploaded_file:
+        st.markdown("### 🏷 Prediction Result")
+        st.success(f"**{pred_class.upper()}** — {confidence * 100:.2f}% Confidence")
+
+        st.markdown("### 📊 Class Probabilities")
+        for i, class_name in enumerate(class_names):
+            percent = float(probs[i]) * 100
+            st.markdown(f"**{class_name.upper()}** — {percent:.2f}%")
+            st.progress(float(probs[i]))  # ✅ FIX: Convert float32 to native float
+
+        st.markdown("### 🔍 Visual Explanation (Grad-CAM)")
+        image_np = np.array(image.resize((224, 224)))
+        cam_overlay = overlay_heatmap(heatmap, image_np)
+        st.image(cam_overlay, use_container_width=True)  # ✅ FIXED DEPRECATION
+
+st.markdown("---")
+
+# --- INFO ---
+st.subheader("Model & Dataset Information")
+st.caption("Our AI models are trained on validated medical datasets and thoroughly tested for accuracy.")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown("*Model Architectures*")
+    st.write("EfficientNet B0")
+    st.write("ResNet18")
+    st.write("Input Size: 224x224")
+
+with col2:
+    st.markdown("*Training Dataset*")
+    st.write("ISIC 2018")
+    st.write("Images: 10,015")
+    st.write("EfficientNet: 7 classes")
+    st.write("ResNet18: 4 classes")
+
+with col3:
+    st.markdown("*Performance (Example)*")
+    st.write("Accuracy: ~88%")
+    st.write("Precision: ~89%")
+    st.write("Recall: ~90%")
+
+# --- DISCLAIMER ---
+st.warning("""
+⚠ *Important Disclaimer*  
+This is a research prototype and educational tool. The predictions made by this AI system are not intended for medical diagnosis or treatment. Please consult certified professionals for clinical decisions.
+""")
+
+# --- FOOTER ---
+st.markdown("---")
+footer1, footer2 = st.columns([1, 3])
+with footer1:
+    st.markdown("### SkinSight AI")
+    st.caption("AI-powered diagnosis for skin lesions.")
+with footer2:
+    st.markdown("""
+- [About](#)
+- [Model Info](#)
+- [Disclaimer](#)
+
+📧 contact@skinsight.ai  
+Made using Streamlit & PyTorch  
+    """)
