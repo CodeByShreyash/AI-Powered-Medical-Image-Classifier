@@ -1,137 +1,153 @@
-# app.py
+# app.py  ── drop this in AI-Powered-Medical-Image-Classifier/
 
+import os, pickle, io
 import streamlit as st
 from PIL import Image
 import numpy as np
 import torch
-import torchvision.transforms as transforms
-from utils.predict import predict
+import torchvision.transforms as T
 from utils.gradcam import GradCAM, overlay_heatmap
-from torchvision.models import efficientnet_b0
-import os
 
-# --- Page Configuration ---
-st.set_page_config(page_title="SkinSight AI", layout="centered")
+# ------------------------------------------------------------------
+# 0.  CONFIG ────────────────────────────────────────────────────────
+MODEL_PATH = "model/model.pth"          # make sure file exists here!
+CLASSES    = ['Benign',
+              'Melanoma',
+              'Basal Cell Carcinoma',
+              'Squamous Cell Carcinoma']   # edit if you have more/less
 
-# --- Custom CSS (optional for cleaner UI) ---
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    header {visibility: hidden;}
-    footer {visibility: hidden;}
-    .css-1d391kg { padding-top: 1rem; }
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="SkinSight AI", layout="centered")
 
-# --- Logo and Title ---
+# Optional logo
 if os.path.exists("assets/logo.png"):
-    st.image("assets/logo.png", width=150)
-st.markdown("## :green[Instant Skin Lesion Diagnosis with AI]")
-st.markdown("Upload a photo. Get prediction & visual explanation in seconds.")
+    st.image("assets/logo.png", width=140)
+st.markdown("## :green[SkinSight AI – Instant Skin‑Lesion Diagnosis]")
+st.write("Upload a skin image to get a prediction and a Grad‑CAM heat‑map.")
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    st.button("🚀 Get Started")
-with col2:
-    st.button("ℹ️ Learn More")
+# ------------------------------------------------------------------
+# 1.  AUTO‑DETECT & LOAD MODEL ─────────────────────────────────────
+ARCH_CANDIDATES = {
+    "efficientnet_b0": {
+        "builder": lambda: __import__("torchvision.models"
+                       ,fromlist=["efficientnet_b0"]).efficientnet_b0(pretrained=False),
+        "target_layer": lambda m: m.features[-1],
+        "fc_attr": ("classifier", 1)          # tuple → getattr + index
+    },
+    "resnet50": {
+        "builder": lambda: __import__("torchvision.models"
+                       ,fromlist=["resnet50"]).resnet50(pretrained=False),
+        "target_layer": lambda m: m.layer4[-1],
+        "fc_attr": ("fc", None)
+    },
+    "resnet34": {
+        "builder": lambda: __import__("torchvision.models"
+                       ,fromlist=["resnet34"]).resnet34(pretrained=False),
+        "target_layer": lambda m: m.layer4[-1],
+        "fc_attr": ("fc", None)
+    },
+    "vgg16": {
+        "builder": lambda: __import__("torchvision.models"
+                       ,fromlist=["vgg16"]).vgg16(pretrained=False),
+        "target_layer": lambda m: m.features[-1],
+        "fc_attr": ("classifier", 6)
+    },
+}
 
-st.markdown("---")
+@st.cache_resource(show_spinner=False)
+def load_state_dict(path:str):
+    """Load state‑dict w/out re‑loading every run."""
+    return torch.load(path, map_location="cpu")
 
-# --- Upload Image ---
-st.markdown("### 🔬 AI-Powered Skin Analysis")
-uploaded_file = st.file_uploader("Upload Skin Image", type=["png", "jpg", "jpeg"])
+def sniff_arch(state_dict):
+    """Rudimentary key‑pattern sniffing."""
+    keys = list(state_dict.keys())
+    if any(k.startswith("classifier.1") for k in keys):
+        return "efficientnet_b0"
+    if any(k.startswith("layer4.") for k in keys) and "fc.weight" in keys:
+        return "resnet50" if "layer3.5.conv1.weight" in keys else "resnet34"
+    if any(k.startswith("features.") for k in keys) and "classifier.6.weight" in keys:
+        return "vgg16"
+    return None
 
-if uploaded_file:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded Image", use_column_width=True)
+@st.cache_resource(show_spinner=True)
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"⚠️ `{MODEL_PATH}` not found. Place your .pth file there.")
 
-    # --- Run Prediction ---
-    results = predict(image)
-    top_class = max(results, key=results.get)
-    confidence = results[top_class] * 100
+    raw_state = load_state_dict(MODEL_PATH)
+    # Some training scripts save {"state_dict": …}
+    state = raw_state["state_dict"] if isinstance(raw_state, dict) and \
+             "state_dict" in raw_state else raw_state
 
-    st.markdown("#### ✅ Prediction Result")
-    st.success(f"**{top_class}** - {confidence:.1f}% Confidence")
+    arch = sniff_arch(state)
+    if arch is None or arch not in ARCH_CANDIDATES:
+        raise ValueError("🚫 Couldn’t auto‑identify architecture. "
+                         "Edit `ARCH_CANDIDATES` or set `arch` manually.")
 
-    st.markdown("##### 📊 Class Probabilities")
-    for cls, prob in results.items():
-        st.write(f"**{cls}**: {prob * 100:.2f}%")
-        st.progress(int(prob * 100))
+    spec = ARCH_CANDIDATES[arch]
+    model = spec["builder"]()
+    # resize final FC layer to match #classes
+    attr, idx = spec["fc_attr"]
+    if idx is None:                   # e.g.  model.fc
+        in_f = getattr(model, attr).in_features
+        setattr(model, attr, torch.nn.Linear(in_f, len(CLASSES)))
+    else:                             # e.g.  model.classifier[1]
+        seq = getattr(model, attr)
+        in_f = seq[idx].in_features
+        seq[idx] = torch.nn.Linear(in_f, len(CLASSES))
 
-    # --- Grad-CAM Heatmap ---
-    st.markdown("##### 🔍 Grad-CAM Heatmap")
-
-    # Load the model
-    model = efficientnet_b0(pretrained=False)
-    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 4)
-    model.load_state_dict(torch.load("model/skin_classifier.pt", map_location="cpu"))
+    model.load_state_dict(state, strict=False)
     model.eval()
+    return model, spec["target_layer"]
 
-    # Preprocess image
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    input_tensor = transform(image.convert("RGB")).unsqueeze(0)
+model, target_layer_fn = load_model()
 
-    # Generate Grad-CAM heatmap
-    target_layer = model.features[-1]
-    cam = GradCAM(model, target_layer)
-    heatmap = cam.generate(input_tensor)
+# ------------------------------------------------------------------
+# 2.  IMAGE PRE‑ & POST‑PROCESS ────────────────────────────────────
+preprocess = T.Compose([
+    T.Resize((224,224)),
+    T.ToTensor(),
+    T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
 
-    # Overlay on image
-    original_np = np.array(image.resize((224, 224)))
-    if original_np.shape[2] == 4:  # Remove alpha channel if present
-        original_np = original_np[:, :, :3]
-    overlay = overlay_heatmap(heatmap, original_np, alpha=0.5)
+def predict_pil(img:Image.Image):
+    x = preprocess(img.convert("RGB")).unsqueeze(0)
+    with torch.no_grad():
+        logits = model(x)
+        probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
+    return probs
 
-    st.image(overlay, caption="Model Attention Heatmap", use_column_width=True)
+# ------------------------------------------------------------------
+# 3.  UI – UPLOAD, PREDICT, GRAD‑CAM ───────────────────────────────
+uploaded = st.file_uploader("Upload JPG/PNG", type=["jpg","jpeg","png"])
+if uploaded:
+    pil_img = Image.open(uploaded)
+    st.image(pil_img, caption="Original upload", use_column_width=True)
 
-    # --- Model Selection (for show) ---
-    st.markdown("#### 🧠 Model Configuration")
-    st.selectbox("Select AI Model", ["EfficientNet B0 (Active)"])
-    st.write("EfficientNet B0 - Balanced accuracy and speed")
-    st.button("🔍 Predict Again")
+    probs = predict_pil(pil_img)
+    top_idx = int(np.argmax(probs))
+    st.success(f"**{CLASSES[top_idx]}** – {probs[top_idx]*100:0.1f}% confidence")
 
-# --- Model Info ---
+    st.markdown("#### Class Probabilities")
+    for lbl, p in zip(CLASSES, probs):
+        st.write(f"{lbl}: {p*100:0.2f}%")
+        st.progress(int(p*100))
+
+    # ---- Grad‑CAM
+    st.markdown("#### Grad‑CAM Heat‑map")
+    cam = GradCAM(model, target_layer_fn(model))
+    heat = cam.generate(preprocess(pil_img).unsqueeze(0))
+    base_np = np.array(pil_img.resize((224,224)))
+    if base_np.shape[2]==4: base_np = base_np[:,:,:3]
+    overlay = overlay_heatmap(heat, base_np, alpha=0.45)
+    st.image(overlay, caption="Model attention", use_column_width=True)
+
+# ------------------------------------------------------------------
+# 4.  FOOTER & INFO ────────────────────────────────────────────────
 st.markdown("---")
-st.markdown("## 📚 Model & Dataset Information")
-
-st.markdown("### 📐 Model Architecture")
-st.write("• Architecture: EfficientNet B0")
-st.write("• Parameters: ~5M")
-st.write("• Input Size: 224x224")
-st.write("• Trained on: ISIC 2018")
-
-st.markdown("### 📈 Performance Metrics")
-st.write("• Accuracy: 88.2%")
-st.write("• Precision: 0.837")
-st.write("• Recall: 0.901")
-st.write("• AUC: 0.923")
-
-st.markdown("### ⚠️ Disclaimer")
-st.warning("""
-This is a research tool for educational/demo purposes only.
-It does not replace professional medical advice or diagnosis.
-""")
-
-# --- Footer ---
-st.markdown("---")
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
-    st.markdown("**SkinSight AI**")
-    st.caption("AI-powered skin lesion analysis")
-with col2:
-    st.markdown("**Quick Links**")
-    st.markdown("- [GitHub](#)\n- [About Us](#)")
-with col3:
-    st.markdown("**Contact**")
-    st.markdown("📧 contact@skinsight.ai")
-
-st.caption("© 2024 SkinSight AI | Made with ❤️ by Shreyash using Streamlit")
-
+st.caption("© 2025 SkinSight AI | Built with Streamlit + PyTorch  •  "
+           "Contact: shreyasvishwakarma00@gmail.com")
 
 
 # import streamlit as st
